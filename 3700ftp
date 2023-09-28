@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+
+import urllib.parse
+import socket
+import os
+import re
+import sys
+
+
+def get_command_line_args():
+    """Get the arguments from the command line."""
+    if len(sys.argv) >= 3:
+        opr = sys.argv[1]
+        arguments = [opr] + sys.argv[2:]
+        return arguments
+
+
+def generate_url_parameters(arguments, opr, parameter1):
+    """ Constructs URL parameters based on the provided API arguments, request type, and a specific parameter."""
+    if opr in ['cp', 'mv']:
+        if re.match('^ftp://', parameter1):
+            url_parameters = extract_url_elements(parameter1)
+            file_path = arguments[2]
+            sender_type = 'SERVER'
+            print(url_parameters, file_path, sender_type)
+        else:
+            parameters2 = arguments[2]
+            url_parameters = extract_url_elements(parameters2)
+            file_path = parameter1
+            sender_type = 'CLIENT'
+            print(url_parameters, file_path, sender_type)
+    else:
+        url_parameters = extract_url_elements(parameter1)
+        file_path = None
+        sender_type = None
+    return url_parameters, file_path, sender_type
+
+
+def connect_to_server(host, port):
+    """Establish a connection to the FTP server."""
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.connect((host, port))
+    return client
+
+
+def extract_params_from_string(param_string):
+    """Split the parameter string by ':' and return individual values."""
+    param1 = param_string.split(':')[0]
+    param2 = param_string.split(':')[1]
+    return param1, param2
+
+
+def get_params(param_str):
+    return param_str.split(':')
+
+
+def extract_url_elements(url):
+    """Extract user, password, host, port, and path from the given URL."""
+    url_parts = urllib.parse.urlparse(url)
+    netloc_parts = url_parts.netloc.split('@')
+
+    user, password = get_params(netloc_parts[0]) if ':' in netloc_parts[0] else (None, '')
+    host, port = get_params(netloc_parts[-1]) if ':' in netloc_parts[-1] else (netloc_parts[-1], 21)
+
+    return [user, password, url_parts.path, host, port]
+
+
+def send_to_ftp(server_socket, message):
+    """Send the given message to the FTP server via the given socket."""
+    message = bytes(message, 'utf-8')
+    total_msgs_sent = 0
+    while total_msgs_sent < len(message):
+        msg_sent = server_socket.send(message)
+        if msg_sent == 0:
+            raise RuntimeError("The Socket connection is broken")
+        total_msgs_sent = total_msgs_sent + msg_sent
+
+
+def receive_from_ftp(server_socket):
+    """Receive a message from the FTP server via the given socket."""
+    parts = []
+    while True:
+        part = server_socket.recv(1024).decode()
+        if not part:
+            break
+        parts.append(part)
+        if part.endswith('\r\n'):
+            break
+    return ''.join(parts)
+
+
+def receive_data_from_channel(data_channel):
+    """Retrieve byte-formatted data from the data channel"""
+    flag = False
+    received_data = b''
+    while not flag:
+        received_data = data_channel.recv(1024)
+        if not data_channel.recv(1024):
+            flag = True
+    return received_data
+
+
+def login_to_ftp_server(client):
+    """Logs in to the FTP server using the provided client and credentials."""
+    args = get_command_line_args()
+    operation, parameter1 = args[:2]
+    parsed_url_params, resource_path, request_sender = generate_url_parameters(args, operation, parameter1)
+
+    if parsed_url_params[0] is None:
+        raise Exception('The server does not support anonymous login.')
+    else:
+        user_command = "USER " + str(parsed_url_params[0]) + "\r\n"
+        send_to_ftp(client, user_command)
+        print(receive_from_ftp(client))
+        password_command = "PASS " + str(parsed_url_params[1]) + "\r\n"
+        send_to_ftp(client, password_command)
+        print(receive_from_ftp(client))
+
+
+def set_transfer_modes(client):
+    """Configure transfer modes for FTP communication."""
+    for command in ["TYPE I\r\n", "MODE S\r\n", "STRU F\r\n"]:
+        send_to_ftp(client, command)
+        print(receive_from_ftp(client))
+
+
+def init_data_channel(client):
+    """Establish a data channel entering Passive Mode and selecting the right host and port"""
+    # Enter Passive Mode
+    passive_command = "PASV\r\n"
+    send_to_ftp(client, passive_command)
+    response = receive_from_ftp(client)
+    print(response)
+
+    # Extract host and port information from the FTP response
+    response_parts = response.split('(')[1][:-4].split(',')
+    host_parts = response_parts[:4]
+    port_parts = response_parts[4:6]
+
+    # Construct the host and port strings
+    host = '.'.join(host_parts)
+    server_port = (int(port_parts[0]) << 8) + int(port_parts[1])
+
+    # A new server socket is created and connected to the data channel
+    data_channel = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # TCP socket Creation
+    data_channel.connect((str(host), server_port))
+
+    return data_channel
+
+
+def create_directory(client, directory_path: str):
+    """Request the FTP server to create a directory at the specified path."""
+    mkd_command = 'MKD ' + str(directory_path) + '\r\n'
+    send_to_ftp(client, mkd_command)
+    print(receive_from_ftp(client))
+
+
+def delete_directory(client, directory_path: str):
+    """Request the FTP server to remove a directory at the specified path."""
+    rmd_command = 'RMD ' + str(directory_path) + '\r\n'
+    send_to_ftp(client, rmd_command)
+    print(receive_from_ftp(client))
+
+
+def list_directory_contents(client, directory_path):
+    """Retrieve and display a list of files and directories from the FTP server."""
+    # Set the correct modes
+    set_transfer_modes(client)
+    if directory_path is None:
+        directory_path = '/'
+    list_directory_command = 'LIST ' + str(directory_path) + '\r\n'
+    data_channel = init_data_channel(client)
+    send_to_ftp(client, list_directory_command)
+    print(receive_data_from_channel(data_channel))
+
+
+def send_data_via_channel(data_channel, file_path):
+    """Send the file located at the given 'file_path' through the specified 'data_channel' as bytes."""
+    with open(file_path, 'rb') as file:
+        file_contents = file.read()
+    data_channel.send(file_contents)
+
+
+def copy_file_from_local_to_server(client, server_path, local_file_path, delete_after_upload):
+    """Upload a file to the FTP server and optionally delete it locally after a successful upload."""
+    set_transfer_modes(client)
+    copy_command = 'STOR ' + str(server_path) + '\r\n'
+    data_channel = init_data_channel(client)
+    send_to_ftp(client, copy_command)
+    send_data_via_channel(data_channel, str(local_file_path))
+    close_data_channel(data_channel)
+    if delete_after_upload:
+        os.remove(local_file_path)
+    print(receive_from_ftp(client))
+
+
+def copy_file_from_server_to_local(client, server_path, local_file_path, delete_after_upload):
+    """Download a file from the FTP server and optionally delete it from the server after a successful download."""
+    set_transfer_modes(client)
+    data_channel = init_data_channel(client)
+    copy_command = 'RETR ' + str(server_path) + '\r\n'
+    send_to_ftp(client, copy_command)
+    receive_data_from_server(data_channel, local_file_path)
+    if delete_after_upload:
+        delete_remote_file(client, server_path)
+    print(receive_from_ftp(client))
+
+
+def receive_data_from_server(data_channel, local_file_path):
+    """Receive data from the server via the data channel and write it to a local file."""
+    with open(local_file_path, 'wb') as local_file:
+        while True:
+            data_chunk = (data_channel.recv(1))
+            if data_chunk == b'':
+                break
+            local_file.write(data_chunk)
+
+
+def delete_remote_file(client, file_path):
+    """Request the FTP server to delete a file at the specified path."""
+    delete_command = 'DELE ' + str(file_path) + '\r\n'
+    send_to_ftp(client, delete_command)
+    print(receive_from_ftp(client))
+
+
+def close_data_channel(channel):
+    """Funtion to close the data channel"""
+    channel.close()
+
+
+def main():
+    """Connect to the FTP server and perform the specified operation."""
+    args = get_command_line_args()
+    opr = args[0]
+    parameter1 = args[1]
+    url_params, path, sender = generate_url_parameters(args, opr, parameter1)
+
+    # Connect to the FTP server
+    ftp_client = connect_to_server(url_params[3], url_params[4])
+
+    # Receive welcome message
+    print(receive_from_ftp(ftp_client))
+
+    # Login to FTP server
+    login_to_ftp_server(ftp_client)
+
+    # Define a dictionary to map operation names to functions
+    operation_functions = {
+        'ls': list_directory_contents,
+        'mkdir': create_directory,
+        'rmdir': delete_directory,
+        'rm': delete_remote_file,
+        'cp': copy_file_from_local_to_server,
+        'mv': copy_file_from_server_to_local,
+    }
+
+    # Perform the specified operation
+    if opr in operation_functions:
+        operation_function = operation_functions[opr]
+        if opr in ('cp', 'mv'):
+            move = (opr == 'mv')
+            server_path = url_params[2]
+            local_path = path
+            operation_function(ftp_client, server_path, local_path, move)
+        else:
+            operation_function(ftp_client, url_params[2])
+
+    # End connection
+    quit_command = 'QUIT\r\n'
+    send_to_ftp(ftp_client, quit_command)
+    print(receive_from_ftp(ftp_client))
+    ftp_client.close()
+
+
+if __name__ == '__main__':
+    main()
+
